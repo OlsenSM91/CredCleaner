@@ -10,6 +10,8 @@ void ClearCreds(LPCTSTR username);
 void DeleteFilesInDirectory(LPCTSTR directory);
 void LogDeletion(LPCTSTR filePath);
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+BOOL IsRunAsAdmin();
+void RelaunchAsAdmin();
 
 // Global variables
 HINSTANCE hInst;
@@ -20,13 +22,21 @@ TCHAR selectedUser[256];
 FILE *logFile;
 
 int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPTSTR lpCmdLine, int nCmdShow) {
+    if (!IsRunAsAdmin()) {
+        RelaunchAsAdmin();
+        return 0; // Exit the current instance as the new elevated instance will continue
+    }
+
     WNDCLASS wc = {0};
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = _T("SimpleCredClearApp");
     wc.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_MYICON));  // Load the icon
 
-    RegisterClass(&wc);
+    if (!RegisterClass(&wc)) {
+        MessageBox(NULL, _T("RegisterClass failed!"), _T("Error"), MB_OK | MB_ICONERROR);
+        return 1;
+    }
 
     HWND hwnd = CreateWindowEx(
         0,
@@ -37,7 +47,13 @@ int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPTSTR lpCm
         NULL, NULL, hInstance, NULL
     );
 
+    if (!hwnd) {
+        MessageBox(NULL, _T("CreateWindowEx failed!"), _T("Error"), MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
     ShowWindow(hwnd, nCmdShow);
+    UpdateWindow(hwnd);
 
     MSG msg = {0};
     while (GetMessage(&msg, NULL, 0, 0)) {
@@ -46,6 +62,40 @@ int APIENTRY _tWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPTSTR lpCm
     }
 
     return (int)msg.wParam;
+}
+
+BOOL IsRunAsAdmin() {
+    BOOL fIsRunAsAdmin = FALSE;
+    PSID pAdministratorsGroup = NULL;
+    // Allocate and initialize a SID of the administrators group.
+    SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(
+            &NtAuthority, 
+            2, 
+            SECURITY_BUILTIN_DOMAIN_RID, 
+            DOMAIN_ALIAS_RID_ADMINS,
+            0, 0, 0, 0, 0, 0, 
+            &pAdministratorsGroup)) {
+        // Determine whether the SID of administrators group is enabled in the primary access token of the process.
+        CheckTokenMembership(NULL, pAdministratorsGroup, &fIsRunAsAdmin);
+        FreeSid(pAdministratorsGroup);
+    }
+    return fIsRunAsAdmin;
+}
+
+void RelaunchAsAdmin() {
+    TCHAR szPath[MAX_PATH];
+    if (GetModuleFileName(NULL, szPath, ARRAYSIZE(szPath))) {
+        // Launch itself as administrator.
+        SHELLEXECUTEINFO sei = { sizeof(sei) };
+        sei.lpVerb = _T("runas");
+        sei.lpFile = szPath;
+        sei.hwnd = NULL;
+        sei.nShow = SW_NORMAL;
+        if (!ShellExecuteEx(&sei)) {
+            MessageBox(NULL, _T("The program requires administrator privileges to run."), _T("Error"), MB_OK | MB_ICONERROR);
+        }
+    }
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
@@ -108,14 +158,15 @@ void ListUsers(HWND hwnd) {
     HANDLE hFind;
     TCHAR path[MAX_PATH];
 
-    _stprintf(path, _T("%s\\Users\\*"), _tgetenv(_T("SystemDrive")));
+    _sntprintf(path, MAX_PATH, _T("%s\\Users\\*"), _tgetenv(_T("SystemDrive")));
 
     hFind = FindFirstFile(path, &findFileData);
     if (hFind != INVALID_HANDLE_VALUE) {
         do {
             if (findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                 if (_tcscmp(findFileData.cFileName, _T(".")) != 0 &&
-                    _tcscmp(findFileData.cFileName, _T("..")) != 0) {
+                    _tcscmp(findFileData.cFileName, _T("..")) != 0 &&
+                    _tcslen(findFileData.cFileName) < sizeof(selectedUser) / sizeof(TCHAR)) {
                     SendMessage(hUserList, LB_ADDSTRING, 0, (LPARAM)findFileData.cFileName);
                 }
             }
@@ -125,6 +176,11 @@ void ListUsers(HWND hwnd) {
 }
 
 void ClearCreds(LPCTSTR username) {
+    if (_tcschr(username, _T('\\')) || _tcschr(username, _T('/')) || _tcschr(username, _T(':'))) {
+        MessageBox(NULL, _T("Invalid username"), _T("Error"), MB_OK | MB_ICONERROR);
+        return;
+    }
+
     TCHAR path[MAX_PATH];
     LPCTSTR directories[] = {
         _T("AppData\\Local\\Microsoft\\Credentials"),
@@ -134,7 +190,7 @@ void ClearCreds(LPCTSTR username) {
     };
 
     for (int i = 0; i < sizeof(directories) / sizeof(directories[0]); i++) {
-        _stprintf(path, _T("%s\\Users\\%s\\%s"), _tgetenv(_T("SystemDrive")), username, directories[i]);
+        _sntprintf(path, MAX_PATH, _T("%s\\Users\\%s\\%s"), _tgetenv(_T("SystemDrive")), username, directories[i]);
         DeleteFilesInDirectory(path);
     }
 }
@@ -145,21 +201,21 @@ void DeleteFilesInDirectory(LPCTSTR directory) {
     TCHAR searchPath[MAX_PATH];
     TCHAR filePath[MAX_PATH];
 
-    _stprintf(searchPath, _T("%s\\*"), directory);
+    _sntprintf(searchPath, MAX_PATH, _T("%s\\*"), directory);
 
     hFind = FindFirstFile(searchPath, &findFileData);
 
     if (hFind != INVALID_HANDLE_VALUE) {
         do {
             if (!(findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                _stprintf(filePath, _T("%s\\%s"), directory, findFileData.cFileName);
+                _sntprintf(filePath, MAX_PATH, _T("%s\\%s"), directory, findFileData.cFileName);
                 if (DeleteFile(filePath)) {
                     LogDeletion(filePath);
                 } else {
                     LogDeletion(_T("Failed to delete file"));
                 }
             } else if (_tcscmp(findFileData.cFileName, _T(".")) != 0 && _tcscmp(findFileData.cFileName, _T("..")) != 0) {
-                _stprintf(filePath, _T("%s\\%s"), directory, findFileData.cFileName);
+                _sntprintf(filePath, MAX_PATH, _T("%s\\%s"), directory, findFileData.cFileName);
                 DeleteFilesInDirectory(filePath);  // Recursively delete files in subdirectories
                 RemoveDirectory(filePath); // Remove the subdirectory
             }
